@@ -2,11 +2,15 @@ import os
 import time
 import base64
 import collections
+import threading
 
+import av
 import cv2
 import numpy as np
 import streamlit as st
 from scipy.spatial import distance as dist
+from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, WebRtcMode
+from streamlit_autorefresh import st_autorefresh
 
 import mediapipe as mp
 from mediapipe.tasks import python as mp_python
@@ -102,10 +106,10 @@ st.markdown(
 )
 
 # ------------------------------------------------------------------
-# Cached resources
+# Resources
 # ------------------------------------------------------------------
-@st.cache_resource(show_spinner=False)
 def load_landmarker(model_path: str):
+    """Not cached so each thread/webrtc session gets its own instance for VIDEO tracking"""
     base_options = mp_python.BaseOptions(model_asset_path=model_path)
     options = mp_vision.FaceLandmarkerOptions(
         base_options=base_options,
@@ -117,17 +121,12 @@ def load_landmarker(model_path: str):
     )
     return mp_vision.FaceLandmarker.create_from_options(options)
 
-
 @st.cache_resource(show_spinner=False)
 def load_segmenter():
-    """Legacy MediaPipe Selfie Segmentation — used to blur everything
-    except the person for the background-blur toggle.
-    Returns None (and the caller disables blur) if this legacy API isn't
-    available in the installed mediapipe build."""
+    """Legacy MediaPipe Selfie Segmentation"""
     if not hasattr(mp, "solutions"):
         return None
     return mp.solutions.selfie_segmentation.SelfieSegmentation(model_selection=1)
-
 
 @st.cache_data(show_spinner=False)
 def get_alarm_base64(path: str):
@@ -136,13 +135,11 @@ def get_alarm_base64(path: str):
     with open(path, "rb") as f:
         return base64.b64encode(f.read()).decode()
 
-
 def eye_aspect_ratio(eye_pts):
     A = dist.euclidean(eye_pts[1], eye_pts[5])
     B = dist.euclidean(eye_pts[2], eye_pts[4])
     C = dist.euclidean(eye_pts[0], eye_pts[3])
     return (A + B) / (2.0 * C) if C != 0 else 0.0
-
 
 def blur_background(frame, segmenter, blur_strength=35):
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -153,10 +150,7 @@ def blur_background(frame, segmenter, blur_strength=35):
     blurred = cv2.GaussianBlur(frame, (k, k), 0)
     return np.where(condition, frame, blurred)
 
-
 def draw_tracking_points(frame, landmarks, w, h):
-    """Draw small ring markers over the eye and mouth landmarks used for
-    EAR / MAR so the detection is visible on the live feed."""
     for idx in LEFT_EYE_INDICES + RIGHT_EYE_INDICES:
         x, y = int(landmarks[idx].x * w), int(landmarks[idx].y * h)
         cv2.circle(frame, (x, y), 4, EYE_COLOR, 2, cv2.LINE_AA)
@@ -167,18 +161,150 @@ def draw_tracking_points(frame, landmarks, w, h):
         cv2.circle(frame, (x, y), 4, MOUTH_COLOR, 2, cv2.LINE_AA)
         cv2.circle(frame, (x, y), 1, MOUTH_COLOR, -1, cv2.LINE_AA)
 
+# ------------------------------------------------------------------
+# Video Processor
+# ------------------------------------------------------------------
+class DrowsinessVideoProcessor(VideoProcessorBase):
+    def __init__(self):
+        self.landmarker = load_landmarker(MODEL_PATH)
+        self.segmenter = load_segmenter()
+        
+        self.mouth_analyzer = MouthAnalyzer(mar_threshold=0.55, yawn_time_threshold=1.5)
+        self.pose_estimator = HeadPoseEstimator(pitch_down_thresh=-18.0, yaw_thresh=22.0)
+        self.drowsiness_engine = DrowsinessIntelligenceEngine(alert_thresh=35.0, drowsy_thresh=70.0)
+        
+        self.lock = threading.Lock()
+        
+        self.ear_threshold = 0.20
+        self.mar_threshold = 0.55
+        self.pitch_thresh = -18.0
+        self.yaw_thresh = 22.0
+        self.alert_thresh = 35.0
+        self.drowsy_thresh = 70.0
+        self.process_every_n = 1
+        self.show_points = True
+        self.blur_bg = False
+        self.blur_strength = 35
+        
+        self.frame_count = 0
+        self.eyes_closed_start = None
+        self.timestamp_ms = 0
+        
+        self.score = 0
+        self.level = "SAFE"
+        self.action_text = "Analyzing..."
+        self.metrics = {}
+        
+        self.fps_counter = 0
+        self.fps_time = time.time()
+        self.fps = 0.0
+
+    def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
+        img = frame.to_ndarray(format="bgr24")
+        img = cv2.flip(img, 1)
+        h, w, _ = img.shape
+        self.frame_count += 1
+        
+        with self.lock:
+            # Sync thresholds from UI
+            self.mouth_analyzer.mar_threshold = self.mar_threshold
+            self.pose_estimator.pitch_down_thresh = self.pitch_thresh
+            self.pose_estimator.yaw_thresh = self.yaw_thresh
+            self.drowsiness_engine.alert_thresh = self.alert_thresh
+            self.drowsiness_engine.drowsy_thresh = self.drowsy_thresh
+            
+            run_heavy = (self.frame_count % max(1, self.process_every_n)) == 0
+            
+            if self.blur_bg and self.segmenter is not None:
+                img = blur_background(img, self.segmenter, self.blur_strength)
+                
+            rgb_frame = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+            
+            self.timestamp_ms += 33
+            
+            try:
+                results = self.landmarker.detect_for_video(mp_image, self.timestamp_ms)
+            except Exception:
+                results = None
+                
+            if results and results.face_landmarks:
+                landmarks = results.face_landmarks[0]
+                if self.show_points:
+                    draw_tracking_points(img, landmarks, w, h)
+                    
+                def get_pts(indices):
+                    return [(landmarks[i].x * w, landmarks[i].y * h) for i in indices]
+
+                left_ear = eye_aspect_ratio(get_pts(LEFT_EYE_INDICES))
+                right_ear = eye_aspect_ratio(get_pts(RIGHT_EYE_INDICES))
+                ear = (left_ear + right_ear) / 2.0
+                
+                if ear < self.ear_threshold:
+                    if self.eyes_closed_start is None:
+                        self.eyes_closed_start = time.time()
+                    closed_duration = time.time() - self.eyes_closed_start
+                else:
+                    self.eyes_closed_start = None
+                    closed_duration = 0.0
+                    
+                eye_data = {
+                    "ear": ear,
+                    "is_closed": ear < self.ear_threshold,
+                    "closed_duration": closed_duration,
+                }
+                
+                if run_heavy:
+                    mouth_data = self.mouth_analyzer.update(landmarks, w, h)
+                    head_pose_data = self.pose_estimator.estimate_pose(landmarks, w, h)
+                    self._last_mouth = mouth_data
+                    self._last_pose = head_pose_data
+                else:
+                    mouth_data = getattr(self, '_last_mouth', {
+                        "mar": 0.0, "is_yawning": False, "yawn_duration": 0.0,
+                        "total_yawns": self.mouth_analyzer.total_yawn_count
+                    })
+                    head_pose_data = getattr(self, '_last_pose', {
+                        "pitch": 0.0, "yaw": 0.0, "roll": 0.0,
+                        "is_head_down": False, "is_looking_away": False, "pose_status": "-"
+                    })
+                    
+                result = self.drowsiness_engine.compute_drowsiness_score(eye_data, mouth_data, head_pose_data)
+                self.score = result["drowsiness_score"]
+                self.level = result["level"]
+                self.action_text = result["action"]
+                
+                self.fps_counter += 1
+                elapsed = time.time() - self.fps_time
+                if elapsed >= 1.0:
+                    self.fps = self.fps_counter / elapsed
+                    self.fps_counter = 0
+                    self.fps_time = time.time()
+                    
+                self.metrics = {
+                    "EAR": f"{ear:.3f}",
+                    "MAR": f"{mouth_data['mar']:.3f}",
+                    "Yawn Count": mouth_data["total_yawns"],
+                    "Pitch": f"{head_pose_data['pitch']:.1f}°",
+                    "Yaw": f"{head_pose_data['yaw']:.1f}°",
+                    "Head Pose": head_pose_data["pose_status"],
+                    "FPS": f"{self.fps:.1f}",
+                }
+            else:
+                self.level = "SAFE"
+                self.score = 0
+                self.action_text = "No face detected in frame"
+                self.metrics = {}
+                
+        return av.VideoFrame.from_ndarray(img, format="bgr24")
 
 # ------------------------------------------------------------------
 # Session state
 # ------------------------------------------------------------------
 defaults = {
-    "run_camera": False,
     "score_history": collections.deque(maxlen=150),
-    "eyes_closed_start": None,
     "alarm_playing": False,
     "last_alarm_push": 0.0,
-    "frame_count": 0,
-    "fps": 0.0,
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -196,15 +322,10 @@ alert_thresh = st.sidebar.slider("Early Warning Threshold", 10.0, 60.0, 35.0, 1.
 drowsy_thresh = st.sidebar.slider("Critical Threshold", 50.0, 100.0, 70.0, 1.0)
 
 st.sidebar.markdown("### Camera & Performance")
-camera_idx = st.sidebar.number_input("Camera Index", min_value=0, max_value=5, value=0, step=1)
 process_every_n = st.sidebar.slider("Frame-skip (mouth/head stages)", 1, 3, 1)
 show_points = st.sidebar.checkbox("Show eye / mouth tracking points", value=True)
 blur_bg = st.sidebar.checkbox("Blur background", value=False)
 blur_strength = st.sidebar.slider("Blur strength", 15, 65, 35, 2, disabled=not blur_bg)
-
-mouth_analyzer = MouthAnalyzer(mar_threshold=mar_threshold, yawn_time_threshold=1.5)
-pose_estimator = HeadPoseEstimator(pitch_down_thresh=pitch_thresh, yaw_thresh=yaw_thresh)
-drowsiness_engine = DrowsinessIntelligenceEngine(alert_thresh=alert_thresh, drowsy_thresh=drowsy_thresh)
 
 # ------------------------------------------------------------------
 # Header
@@ -213,12 +334,6 @@ head_l, head_r = st.columns([3, 1])
 with head_l:
     st.markdown('<p class="app-title">DROWSINESS INTELLIGENCE</p>', unsafe_allow_html=True)
     st.markdown('<p class="app-sub">Real-time driver monitoring · eye, mouth & head-pose fusion</p>', unsafe_allow_html=True)
-with head_r:
-    c1, c2 = st.columns(2)
-    if c1.button("Start", use_container_width=True, type="primary"):
-        st.session_state.run_camera = True
-    if c2.button("Stop", use_container_width=True):
-        st.session_state.run_camera = False
 
 st.write("")
 
@@ -226,15 +341,6 @@ st.write("")
 # Layout
 # ------------------------------------------------------------------
 video_col, dash_col = st.columns([3, 2])
-
-with video_col:
-    st.markdown('<div class="panel"><div class="panel-title">Live Feed</div>', unsafe_allow_html=True)
-    video_placeholder = st.empty()
-    st.markdown('</div>', unsafe_allow_html=True)
-
-    st.markdown('<div class="panel"><div class="panel-title">Score Trend</div>', unsafe_allow_html=True)
-    chart_placeholder = st.empty()
-    st.markdown('</div>', unsafe_allow_html=True)
 
 with dash_col:
     st.markdown('<div class="panel">', unsafe_allow_html=True)
@@ -273,6 +379,9 @@ def render_gauge(level, score, action_text):
 
 
 def render_metrics(m):
+    if not m:
+        metrics_placeholder.markdown("<div class='action-text'>No data</div>", unsafe_allow_html=True)
+        return
     rows = "".join(
         f"""<div class="stat-row"><span class="stat-key">{k}</span><span class="stat-val">{v}</span></div>"""
         for k, v in m.items()
@@ -296,170 +405,72 @@ def stop_alarm():
     alarm_placeholder.empty()
     st.session_state.alarm_playing = False
 
-
 # ------------------------------------------------------------------
 # Main real-time loop
 # ------------------------------------------------------------------
-if st.session_state.run_camera:
+with video_col:
+    st.markdown('<div class="panel"><div class="panel-title">Live Feed</div>', unsafe_allow_html=True)
     if not os.path.exists(MODEL_PATH):
         st.error(
             "face_landmarker.task model file not found. "
             "Make sure it sits in the same folder as streamlit_app.py."
         )
-        st.session_state.run_camera = False
     else:
-        landmarker = load_landmarker(MODEL_PATH)
-        segmenter = load_segmenter() if blur_bg else None
-        if blur_bg and segmenter is None:
-            st.sidebar.warning(
-                "Background blur isn't available with the installed mediapipe "
-                "version (legacy `solutions` API missing) — continuing without it."
-            )
-        cap = cv2.VideoCapture(int(camera_idx))
+        ctx = webrtc_streamer(
+            key="drowsiness-cam",
+            mode=WebRtcMode.SENDRECV,
+            video_processor_factory=DrowsinessVideoProcessor,
+            rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
+            media_stream_constraints={"video": True, "audio": False},
+            async_processing=True,
+        )
+    st.markdown('</div>', unsafe_allow_html=True)
+    
+    st.markdown('<div class="panel"><div class="panel-title">Score Trend</div>', unsafe_allow_html=True)
+    chart_placeholder = st.empty()
+    st.markdown('</div>', unsafe_allow_html=True)
 
-        if not cap.isOpened():
-            st.error("Could not open the camera. Check the connection / permissions.")
-            st.session_state.run_camera = False
-        else:
-            timestamp_ms = 0
-            fps_time = time.time()
-            fps_counter = 0
+if 'ctx' in locals() and ctx.video_processor:
+    # Update processor thresholds from Streamlit sidebar
+    with ctx.video_processor.lock:
+        ctx.video_processor.ear_threshold = ear_threshold
+        ctx.video_processor.mar_threshold = mar_threshold
+        ctx.video_processor.pitch_thresh = pitch_thresh
+        ctx.video_processor.yaw_thresh = yaw_thresh
+        ctx.video_processor.alert_thresh = alert_thresh
+        ctx.video_processor.drowsy_thresh = drowsy_thresh
+        ctx.video_processor.process_every_n = process_every_n
+        ctx.video_processor.show_points = show_points
+        ctx.video_processor.blur_bg = blur_bg
+        ctx.video_processor.blur_strength = blur_strength
 
-            try:
-                while st.session_state.run_camera:
-                    success, frame = cap.read()
-                    if not success:
-                        st.warning("Lost camera stream.")
-                        break
-
-                    try:
-                        frame = cv2.flip(frame, 1)
-                        h, w, _ = frame.shape
-                        st.session_state.frame_count += 1
-                        run_heavy = (st.session_state.frame_count % process_every_n) == 0
-
-                        if blur_bg and segmenter is not None:
-                            frame = blur_background(frame, segmenter, blur_strength)
-
-                        # Convert the current frame to MediaPipe Image once.
-                        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                        mp_image = mp.Image(
-                            image_format=mp.ImageFormat.SRGB,
-                            data=rgb_frame
-                        )
-
-                        # VIDEO mode requires a strictly increasing timestamp.
-                        timestamp_ms += 33
-                        results = landmarker.detect_for_video(mp_image, timestamp_ms)
-
-                        if results.face_landmarks:
-                            landmarks = results.face_landmarks[0]
-
-                            if show_points:
-                                draw_tracking_points(frame, landmarks, w, h)
-
-                            def get_pts(indices):
-                                return [
-                                    (landmarks[i].x * w, landmarks[i].y * h)
-                                    for i in indices
-                                ]
-
-                            left_ear = eye_aspect_ratio(get_pts(LEFT_EYE_INDICES))
-                            right_ear = eye_aspect_ratio(get_pts(RIGHT_EYE_INDICES))
-                            ear = (left_ear + right_ear) / 2.0
-
-                            if ear < ear_threshold:
-                                if st.session_state.eyes_closed_start is None:
-                                    st.session_state.eyes_closed_start = time.time()
-                                closed_duration = (
-                                    time.time() - st.session_state.eyes_closed_start
-                                )
-                            else:
-                                st.session_state.eyes_closed_start = None
-                                closed_duration = 0.0
-
-                            eye_data = {
-                                "ear": ear,
-                                "is_closed": ear < ear_threshold,
-                                "closed_duration": closed_duration,
-                            }
-
-                            if run_heavy:
-                                mouth_data = mouth_analyzer.update(landmarks, w, h)
-                                head_pose_data = pose_estimator.estimate_pose(landmarks, w, h)
-                            else:
-                                mouth_data = {
-                                    "mar": 0.0,
-                                    "is_yawning": False,
-                                    "yawn_duration": 0.0,
-                                    "total_yawns": mouth_analyzer.total_yawn_count,
-                                }
-                                head_pose_data = {
-                                    "pitch": 0.0,
-                                    "yaw": 0.0,
-                                    "roll": 0.0,
-                                    "is_head_down": False,
-                                    "is_looking_away": False,
-                                    "pose_status": "-",
-                                }
-
-                            result = drowsiness_engine.compute_drowsiness_score(
-                                eye_data,
-                                mouth_data,
-                                head_pose_data,
-                            )
-                            score = result["drowsiness_score"]
-                            level = result["level"]
-                            st.session_state.score_history.append(score)
-
-                            render_gauge(level, score, result["action"])
-                            render_metrics({
-                                "EAR": f"{ear:.3f}",
-                                "MAR": f"{mouth_data['mar']:.3f}",
-                                "Yawn Count": mouth_data["total_yawns"],
-                                "Pitch": f"{head_pose_data['pitch']:.1f}°",
-                                "Yaw": f"{head_pose_data['yaw']:.1f}°",
-                                "Head Pose": head_pose_data["pose_status"],
-                                "FPS": f"{st.session_state.fps:.1f}",
-                            })
-
-                            if level == "CRITICAL":
-                                push_alarm()
-                                st.session_state.alarm_playing = True
-                            elif st.session_state.alarm_playing:
-                                stop_alarm()
-                        else:
-                            render_gauge("SAFE", 0, "No face detected in frame")
-                            stop_alarm()
-
-                        fps_counter += 1
-                        elapsed = time.time() - fps_time
-                        if elapsed >= 1.0:
-                            st.session_state.fps = fps_counter / elapsed
-                            fps_counter = 0
-                            fps_time = time.time()
-
-                        video_placeholder.image(
-                            frame,
-                            channels="BGR",
-                            use_container_width=True,
-                        )
-
-                        if st.session_state.score_history:
-                            chart_placeholder.line_chart(
-                                list(st.session_state.score_history),
-                                height=160,
-                            )
-                    except Exception as frame_err:
-                        st.warning(f"Skipped a bad frame: {frame_err}")
-
-            finally:
-                cap.release()
+if 'ctx' in locals() and ctx.state.playing:
+    # Trigger a rerun every 500ms to update UI
+    st_autorefresh(interval=500, key="data_refresh")
+    
+    if ctx.video_processor:
+        with ctx.video_processor.lock:
+            score = ctx.video_processor.score
+            level = ctx.video_processor.level
+            action_text = ctx.video_processor.action_text
+            metrics = ctx.video_processor.metrics.copy()
+            
+        st.session_state.score_history.append(score)
+        
+        render_gauge(level, score, action_text)
+        render_metrics(metrics)
+            
+        if st.session_state.score_history:
+            chart_placeholder.line_chart(list(st.session_state.score_history), height=160)
+            
+        if level == "CRITICAL":
+            push_alarm()
+            st.session_state.alarm_playing = True
+        elif st.session_state.alarm_playing:
+            stop_alarm()
 else:
-    video_placeholder.info("Click **Start** to begin real-time monitoring.")
     render_gauge("SAFE", 0, "Camera is idle")
+    render_metrics({})
+    if st.session_state.score_history:
+        chart_placeholder.line_chart(list(st.session_state.score_history), height=160)
     stop_alarm()
-
-
-
-###py -3.11 -m streamlit run streamlit_app.py
