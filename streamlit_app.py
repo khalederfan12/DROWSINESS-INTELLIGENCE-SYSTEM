@@ -746,6 +746,7 @@ def clear_alarm():
 # ------------------------------------------------------------------
 # WebRTC streamer
 # ------------------------------------------------------------------
+# ------------------------------------------------------------------
 with video_col:
 
     st.markdown(
@@ -767,31 +768,37 @@ with video_col:
         ctx = webrtc_streamer(
             key="drowsiness-cam",
             mode=WebRtcMode.SENDRECV,
+
             video_processor_factory=DrowsinessVideoProcessor,
 
             rtc_configuration={
                 "iceServers": [
                     {
-                        "urls": [
-                            "stun:stun.l.google.com:19302"
-                        ]
+                        "urls": "stun:stun.l.google.com:19302"
                     }
                 ]
             },
 
             media_stream_constraints={
-                "video": {
-                    "width": {"ideal": 480},
-                    "height": {"ideal": 360},
-                    "frameRate": {"ideal": 10},
-                },
+                "video": True,
                 "audio": False,
             },
 
-            # Better for real-time processing than forcing
-            # synchronous processing on the WebRTC path.
             async_processing=False,
         )
+
+    st.markdown(
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+    st.markdown(
+        '<div class="panel">'
+        '<div class="panel-title">Score Trend</div>',
+        unsafe_allow_html=True,
+    )
+
+    chart_placeholder = st.empty()
 
     st.markdown(
         '</div>',
