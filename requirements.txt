@@ -4,5 +4,5 @@ mediapipe==0.10.14
 scipy==1.13.1
 streamlit==1.39.0
 streamlit-webrtc==0.47.9
-av==12.3.1
+av==12.3.0
 streamlit-autorefresh==1.0.1
