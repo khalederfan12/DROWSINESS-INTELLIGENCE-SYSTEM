@@ -790,7 +790,7 @@ with video_col:
 
             # Better for real-time processing than forcing
             # synchronous processing on the WebRTC path.
-            async_processing=True,
+            async_processing=False,
         )
 
     st.markdown(
